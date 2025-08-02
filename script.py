@@ -1,4 +1,4 @@
-import streamlit as st
+from flask import Flask, request, render_template_string, send_file
 import pandas as pd
 from io import BytesIO
 from bs4 import BeautifulSoup
@@ -6,15 +6,26 @@ from playwright.sync_api import sync_playwright
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, Alignment
 
-# UI state holders
-if 'excel_data' not in st.session_state:
-    st.session_state.excel_data = None
-if 'scrape_log' not in st.session_state:
-    st.session_state.scrape_log = []
-if 'scraping' not in st.session_state:
-    st.session_state.scraping = False
-if 'page' not in st.session_state:
-    st.session_state.page = 0
+app = Flask(__name__)
+scrape_log = []
+excel_data = None
+
+HTML_TEMPLATE = """
+<!doctype html>
+<title>ICAEW Firm Scraper</title>
+<h1>🔍 ICAEW Firm Scraper</h1>
+<p>This tool scrapes firm data from ICAEW and exports to Excel.</p>
+<form method="post" action="/scrape">
+  <button type="submit">Start Scraping</button>
+</form>
+{% if log %}
+  <h2>Scraping Log:</h2>
+  <pre>{{ log }}</pre>
+{% endif %}
+{% if download %}
+  <a href="/download">📥 Download Excel</a>
+{% endif %}
+"""
 
 def is_last_page(soup):
     nav = soup.select_one('ul.pagination')
@@ -40,7 +51,8 @@ def get_dd_by_dt_text(soup, dt_text):
     return None
 
 def scrape_all_pages():
-    st.session_state.scrape_log.clear()
+    global excel_data
+    scrape_log.clear()
     base_url = "https://find.icaew.com/search?searchType=firm&term=&location_freetext=e11+1jz&page={}"
     page = 1
     data = []
@@ -55,8 +67,7 @@ def scrape_all_pages():
         detail_page = context.new_page()
 
         while True:
-            st.session_state.page = page
-            st.session_state.scrape_log.append(f"Scraping page {page}...")
+            scrape_log.append(f"Scraping page {page}...")
             url = base_url.format(page)
             page_obj.goto(url)
             page_obj.wait_for_selector('#results')
@@ -73,15 +84,10 @@ def scrape_all_pages():
                     address = get_dd_by_dt_text(soup1, "Address")
                     website = get_dd_by_dt_text(soup1, "Website")
                     email = get_dd_by_dt_text(soup1, "Email address")
-                    data.append({
-                        "Name": name,
-                        "Address": address,
-                        "Website": website,
-                        "Email": email
-                    })
-                    st.session_state.scrape_log.append(f"✔ Scraped firm: {name}")
+                    data.append({"Name": name, "Address": address, "Website": website, "Email": email})
+                    scrape_log.append(f"✔ Scraped firm: {name}")
                 except Exception:
-                    st.session_state.scrape_log.append(f"⚠ Error scraping firm at {link}, skipping...")
+                    scrape_log.append(f"⚠ Error scraping firm at {link}, skipping...")
                     continue
 
             if is_last_page(soup):
@@ -95,45 +101,30 @@ def scrape_all_pages():
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, sheet_name='Firms', index=False)
         worksheet = writer.sheets['Firms']
-
         for i, column in enumerate(df.columns, 1):
             max_length = max(df[column].astype(str).map(len).max(), len(column)) + 2
             col_letter = get_column_letter(i)
             worksheet.column_dimensions[col_letter].width = max_length
-
         header_font = Font(bold=True)
         for cell in worksheet[1]:
             cell.font = header_font
             cell.alignment = Alignment(horizontal='center')
 
     output.seek(0)
-    st.session_state.excel_data = output.read()
-    st.session_state.scraping = False
-    st.session_state.page = 0
-    st.session_state.scrape_log.append("✅ Scraping complete.")
+    excel_data = output
 
-# --- Streamlit UI ---
+@app.route("/", methods=["GET"])
+def index():
+    return render_template_string(HTML_TEMPLATE, log=None, download=False)
 
-st.set_page_config(page_title="Firm Scraper", layout="wide", initial_sidebar_state="auto")
-
-st.title("🔍 ICAEW Firm Scraper")
-st.markdown("This tool scrapes firm data from ICAEW and exports to Excel.")
-
-if st.button("Start Scraping"):
-    st.session_state.scraping = True
+@app.route("/scrape", methods=["POST"])
+def start_scrape():
     scrape_all_pages()
+    return render_template_string(HTML_TEMPLATE, log="\n".join(scrape_log), download=True)
 
-# Show current scraping status
-if st.session_state.scraping:
-    st.info(f"Scraping in progress... Currently on page {st.session_state.page}")
-else:
-    st.success("Idle. Ready to scrape.")
+@app.route("/download")
+def download():
+    return send_file(excel_data, download_name="firms.xlsx", as_attachment=True)
 
-# Log output
-st.subheader("Scraping Log")
-for line in st.session_state.scrape_log:
-    st.text(line)
-
-# Download button
-if st.session_state.excel_data:
-    st.download_button("📥 Download Excel", st.session_state.excel_data, file_name="firms.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=8080)
