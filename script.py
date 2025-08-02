@@ -1,14 +1,19 @@
-from flask import Flask, send_file, render_template_string, request
+from flask import Flask, send_file, render_template_string, request, jsonify
 import pandas as pd
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, Alignment
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 from io import BytesIO
+import threading
 
 app = Flask(__name__)
 
-# Paste your scraping functions here (is_last_page, scrape_page_items, get_dd_by_dt_text)
+excel_data = None
+scraping_in_progress = False
+current_page = 0
+scrape_log = []
+
 def is_last_page(soup):
     nav = soup.select_one('ul.pagination')
     if nav:
@@ -33,6 +38,8 @@ def get_dd_by_dt_text(soup, dt_text):
     return None
 
 def scrape_all_pages():
+    global excel_data, scraping_in_progress, current_page, scrape_log
+    scrape_log = []  # clear log on start
     base_url = "https://find.icaew.com/search?searchType=firm&term=&location_freetext=e11+1jz&page={}"
     page = 1
     data = []
@@ -47,6 +54,8 @@ def scrape_all_pages():
         page1 = context.new_page()
 
         while True:
+            current_page = page
+            scrape_log.append(f"Scraping page {page}...")
             url = base_url.format(page)
             page_obj.goto(url)
             page_obj.wait_for_selector('#results')
@@ -74,7 +83,9 @@ def scrape_all_pages():
                         "Website": website,
                         "Email": email
                     })
+                    scrape_log.append(f"Scraped firm: {name}")
                 except Exception:
+                    scrape_log.append("Error scraping a firm, skipping...")
                     continue
 
             if is_last_page(soup):
@@ -84,30 +95,31 @@ def scrape_all_pages():
 
         browser.close()
 
-    # Create Excel file in-memory
     df = pd.DataFrame(data)
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, sheet_name='Firms', index=False)
         worksheet = writer.sheets['Firms']
 
-        # Auto-adjust column widths
         for i, column in enumerate(df.columns, start=1):
             max_length = max(df[column].astype(str).map(len).max(), len(column)) + 2
             col_letter = get_column_letter(i)
             worksheet.column_dimensions[col_letter].width = max_length
 
-        # Bold headers and center align
         header_font = Font(bold=True)
         for cell in worksheet[1]:
             cell.font = header_font
             cell.alignment = Alignment(horizontal='center')
 
     output.seek(0)
-    return output
+    excel_data = output.read()
+    scraping_in_progress = False
+    current_page = 0
+    scrape_log.append("Scraping complete.")
 
-# Simple stylish HTML template with a button
-HTML = '''
+@app.route('/')
+def index():
+    return render_template_string('''
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -115,40 +127,155 @@ HTML = '''
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>ICAEW Scraper</title>
 <style>
-  body { font-family: Arial, sans-serif; background: #f0f2f5; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-  h1 { color: #333; }
+  body {
+    font-family: Arial, sans-serif;
+    background: #121212;
+    color: #eee;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    height: 100vh;
+    margin: 0;
+  }
+  h1 { color: #4caf50; }
   button {
-    background-color: #007bff; color: white; border: none; padding: 15px 30px; font-size: 18px; border-radius: 8px; cursor: pointer;
-    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    background-color: #4caf50;
+    color: #121212;
+    border: none;
+    padding: 15px 30px;
+    font-size: 18px;
+    border-radius: 8px;
+    cursor: pointer;
+    box-shadow: 0 4px 8px rgba(76, 175, 80, 0.4);
     transition: background-color 0.3s ease;
   }
-  button:hover { background-color: #0056b3; }
-  .message { margin-top: 20px; color: #555; }
+  button:hover {
+    background-color: #388e3c;
+  }
+  #status {
+    margin-top: 20px;
+    color: #aaa;
+    font-size: 16px;
+  }
+  #log {
+    max-height: 200px;
+    overflow-y: auto;
+    background: #222;
+    padding: 10px;
+    border-radius: 5px;
+    margin-top: 10px;
+    color: #4caf50;
+    white-space: pre-wrap;
+    font-family: monospace;
+    width: 400px;
+  }
 </style>
 </head>
 <body>
 <h1>ICAEW Scraper</h1>
-<form method="POST" action="/download">
-  <button type="submit">Start Scraping & Download Excel</button>
-</form>
+<button id="startBtn">Start Scraping & Download Excel</button>
+<div id="status"></div>
+<pre id="log"></pre>
+
+<script>
+  const btn = document.getElementById('startBtn');
+  const status = document.getElementById('status');
+  const log = document.getElementById('log');
+
+  btn.onclick = () => {
+    btn.disabled = true;
+    status.textContent = 'Starting scraping...';
+    log.textContent = '';
+
+    fetch('/start_scraping', { method: 'POST' })
+      .then(response => response.json())
+      .then(data => {
+        if (data.status === 'started') {
+          checkProgress();
+        } else if (data.status === 'already_running') {
+          status.textContent = 'Scraping already in progress. Please wait...';
+          btn.disabled = true;
+        } else {
+          status.textContent = 'Error starting scraping.';
+          btn.disabled = false;
+        }
+      })
+      .catch(() => {
+        status.textContent = 'Network error.';
+        btn.disabled = false;
+      });
+  };
+
+  function checkProgress() {
+    const poll = setInterval(() => {
+      fetch('/scraping_status')
+        .then(res => res.json())
+        .then(data => {
+          if (!data.in_progress) {
+            clearInterval(poll);
+            status.textContent = 'Scraping complete! Download will start shortly.';
+            log.textContent = data.log.join('\\n');
+            downloadFile();
+            btn.disabled = false;
+          } else {
+            status.textContent = 'Scraping page ' + data.current_page + '...';
+            log.textContent = data.log.join('\\n');
+            log.scrollTop = log.scrollHeight; // auto scroll to bottom
+          }
+        })
+        .catch(() => {
+          clearInterval(poll);
+          status.textContent = 'Error checking status.';
+          btn.disabled = false;
+        });
+    }, 2000);
+  }
+
+  function downloadFile() {
+    const link = document.createElement('a');
+    link.href = '/download_excel';
+    link.download = 'icaew_firms.xlsx';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    status.textContent = 'Download started!';
+  }
+</script>
 </body>
 </html>
-'''
+''')
 
-@app.route('/', methods=['GET'])
-def index():
-    return render_template_string(HTML)
+@app.route('/start_scraping', methods=['POST'])
+def start_scraping():
+    global scraping_in_progress
+    if scraping_in_progress:
+        return jsonify({"status": "already_running"})
 
-@app.route('/download', methods=['POST'])
-def download():
-    # Run scraper and get Excel file bytes
-    excel_file = scrape_all_pages()
-    return send_file(
-        excel_file,
-        download_name="icaew_firms.xlsx",
-        as_attachment=True,
-        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-    )
+    scraping_in_progress = True
+    threading.Thread(target=scrape_all_pages).start()
+
+    return jsonify({"status": "started"})
+
+@app.route('/scraping_status')
+def scraping_status():
+    global scraping_in_progress, current_page, scrape_log
+    last_logs = scrape_log[-20:]  # send last 20 lines
+    return jsonify({
+        "in_progress": scraping_in_progress,
+        "current_page": current_page,
+        "log": last_logs
+    })
+
+@app.route('/download_excel')
+def download_excel():
+    global excel_data
+    if excel_data:
+        return send_file(
+            BytesIO(excel_data),
+            download_name="icaew_firms.xlsx",
+            as_attachment=True,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+    else:
+        return "File not ready", 404
 
 if __name__ == '__main__':
     app.run(debug=True)
